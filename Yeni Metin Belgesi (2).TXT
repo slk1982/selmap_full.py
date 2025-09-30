@@ -1,0 +1,16 @@
+# SelMap — Safe Nmap Results Manager (Full)
+
+SelMap is a local, safe tool that parses Nmap output files and helps you manage, edit, and report results.
+**IMPORTANT:** SelMap NEVER performs network scanning. It only parses user-supplied Nmap outputs and local vulnerability DB files.
+
+## Features
+- Parse `.gnmap` and `.xml` Nmap outputs
+- Editable results table and bulk rename of services
+- Basic heuristic risk scoring
+- Local CVE matching (user-provided JSON/CSV)
+- Export CSV / JSON / GNMAP-like text
+- Generate PDF and plain text reports
+
+## Requirements
+Python 3.8+
+Install dependencies:

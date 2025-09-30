@@ -1,0 +1,324 @@
+# selmap_full.py
+# SelMap — Full (Safe) Nmap Results Manager with PDF, local CVE lookup, editable table, exports
+# Usage: pip install -r requirements.txt
+#        streamlit run selmap_full.py
+#
+# IMPORTANT: This application does NOT perform any network scanning.
+# It only parses user-supplied Nmap output files and local vuln DB files.
+
+import streamlit as st
+import pandas as pd
+import xml.etree.ElementTree as ET
+from io import StringIO, BytesIO
+from datetime import datetime
+import json
+from dateutil import parser as dateparser
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+import base64
+import tempfile
+
+st.set_page_config(page_title="SelMap — Full", layout="wide")
+st.title("SelMap — Full (Safe Nmap Results Manager)")
+
+st.markdown("""
+SelMap — güvenli, yerel ve offline kullanıma yönelik Nmap sonuç yönetim aracı. **Uyarı:** SelMap ağ taraması yapmaz.  
+Yalnızca sizin yüklediğiniz Nmap çıktısı ve (isteğe bağlı) yerel vuln DB ile çalışır.
+""")
+
+# -------------------------
+# Helper parsers
+# -------------------------
+def parse_gnmap(text):
+    rows = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or not line.startswith("Host:"):
+            continue
+        try:
+            host_part, ports_part = line.split("Ports:")
+        except ValueError:
+            continue
+        host = host_part.split()[1]
+        status = "unknown"
+        if "Status:" in host_part:
+            try:
+                status = host_part.split("Status:")[1].strip()
+            except:
+                status = "unknown"
+        ports = ports_part.strip().split(',')
+        for p in ports:
+            p = p.strip()
+            if not p:
+                continue
+            parts = p.split('/')
+            port = parts[0] if len(parts) > 0 else ""
+            state = parts[1] if len(parts) > 1 else ""
+            proto = parts[2] if len(parts) > 2 else ""
+            service = parts[4] if len(parts) > 4 else ""
+            rows.append({
+                "host": host,
+                "port": int(port) if str(port).isdigit() else port,
+                "state": state,
+                "proto": proto,
+                "service": service,
+                "raw": p,
+                "status": status,
+                "version": ""
+            })
+    return pd.DataFrame(rows)
+
+def parse_nmap_xml(content):
+    rows = []
+    try:
+        root = ET.fromstring(content)
+    except Exception as e:
+        raise
+    for host in root.findall('host'):
+        ip = "unknown"
+        addr = host.find('address')
+        if addr is not None and 'addr' in addr.attrib:
+            ip = addr.get('addr')
+        status_el = host.find('status')
+        status = status_el.get('state') if status_el is not None else ''
+        ports = host.find('ports')
+        if ports is None:
+            continue
+        for port in ports.findall('port'):
+            portid = port.get('portid')
+            proto = port.get('protocol')
+            state_el = port.find('state')
+            state = state_el.get('state') if state_el is not None else ''
+            svc_el = port.find('service')
+            svc = svc_el.get('name') if svc_el is not None and 'name' in svc_el.attrib else ''
+            version = ""
+            if svc_el is not None:
+                product = svc_el.get('product','')
+                ver = svc_el.get('version','')
+                version = (product + " " + ver).strip()
+            rows.append({
+                "host": ip,
+                "port": int(portid) if portid and str(portid).isdigit() else portid,
+                "state": state,
+                "proto": proto,
+                "service": svc,
+                "version": version,
+                "raw": "",
+                "status": status
+            })
+    return pd.DataFrame(rows)
+
+# -------------------------
+# Risk scoring (simple heuristics)
+# -------------------------
+def risk_score(row):
+    svc = str(row.get("service","")).lower()
+    version = str(row.get("version","")).lower()
+    port = str(row.get("port",""))
+    score = 0
+    reasons = []
+    if svc in ("ssh","telnet"):
+        score += 2
+        reasons.append("remote-access")
+    if svc in ("ftp", "tftp"):
+        score += 2
+        reasons.append("legacy-file-service")
+    if svc.startswith("http") or svc in ("http","https","http-proxy","apache","nginx","iis"):
+        score += 1
+        reasons.append("web-service")
+    # suspicious ports
+    if port in ("21","23","69"):
+        score += 1
+    # version hints (very naive)
+    if "openssl" in version and ("1.0" in version or "1.1.0" in version):
+        score += 2
+        reasons.append("old-openssl")
+    # cap
+    if score >= 4:
+        level = "Critical"
+    elif score >= 3:
+        level = "High"
+    elif score >= 1:
+        level = "Medium"
+    else:
+        level = "Low"
+    return score, level, "; ".join(reasons) if reasons else "none"
+
+# -------------------------
+# UI: sidebar project / upload
+# -------------------------
+st.sidebar.header("Project Settings")
+project = st.sidebar.text_input("Project name", value=f"selmap-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}")
+uploaded = st.file_uploader("Upload Nmap output (.gnmap, .xml, .txt)", type=['gnmap','xml','txt'])
+sample_btn = st.sidebar.button("Load sample demo data")
+
+df = pd.DataFrame()
+if uploaded:
+    content = uploaded.read().decode('utf-8', errors='ignore')
+    if uploaded.name.endswith('.gnmap') or uploaded.name.endswith('.txt'):
+        df = parse_gnmap(content)
+    elif uploaded.name.endswith('.xml'):
+        try:
+            df = parse_nmap_xml(content)
+        except Exception as e:
+            st.error(f"XML Parse Error: {e}")
+            df = pd.DataFrame()
+else:
+    if sample_btn:
+        sample_gn = """Host: 192.0.2.10 ()  Status: Up\tPorts: 22/open/tcp//ssh///,80/open/tcp//http///,8080/open/tcp//http-proxy///\t"""
+        df = parse_gnmap(sample_gn)
+
+if not df.empty:
+    # compute risk
+    scores = df.apply(lambda r: risk_score(r), axis=1)
+    df["risk_score"] = [s[0] for s in scores]
+    df["risk_level"] = [s[1] for s in scores]
+    df["risk_reasons"] = [s[2] for s in scores]
+
+    # filter and search
+    st.markdown("### Results — editable")
+    cols = st.columns([3,1,1,1,1])
+    q = cols[0].text_input("Search host/service/port", value="")
+    flt_level = cols[1].selectbox("Risk level", ["All","Critical","High","Medium","Low"], index=0)
+    proto_sel = cols[2].selectbox("Proto", ["All"] + sorted(df['proto'].dropna().unique().astype(str).tolist()), index=0)
+    state_sel = cols[3].selectbox("State", ["All"] + sorted(df['state'].dropna().unique().astype(str).tolist()), index=0)
+    sort_sel = cols[4].selectbox("Sort by", ["host","risk_score","port"], index=0)
+
+    view_df = df.copy()
+    if q:
+        ql = q.lower()
+        view_df = view_df[view_df.apply(lambda r: ql in str(r['host']).lower() or ql in str(r['service']).lower() or ql in str(r['port']), axis=1)]
+    if flt_level != "All":
+        view_df = view_df[view_df['risk_level']==flt_level]
+    if proto_sel != "All":
+        view_df = view_df[view_df['proto']==proto_sel]
+    if state_sel != "All":
+        view_df = view_df[view_df['state']==state_sel]
+    if sort_sel:
+        view_df = view_df.sort_values(by=sort_sel, ascending=True)
+
+    edited = st.experimental_data_editor(view_df.reset_index(drop=True), num_rows="dynamic")
+    # bulk rename in sidebar
+    st.sidebar.markdown("### Bulk rename services")
+    services = sorted(df['service'].fillna('').unique())
+    bulk_old = st.sidebar.selectbox("Select service to replace (bulk)", [""] + services)
+    bulk_new = st.sidebar.text_input("New service name for bulk replace")
+    if st.sidebar.button("Apply bulk rename") and bulk_old and bulk_new:
+        df.loc[df['service']==bulk_old, 'service'] = bulk_new
+        st.experimental_rerun()
+
+    st.markdown("### Current view / exports")
+    st.dataframe(edited)
+
+    # Local CVE matching
+    st.markdown("### Local CVE matching (optional)")
+    st.markdown("Upload a *local* vuln DB JSON (list of {product,cve,summary}) or CSV (columns including product/cve). SelMap will only perform local matching; no external requests are made.")
+    vuln_file = st.file_uploader("Upload local vuln DB JSON/CSV", type=['json','csv'])
+    cve_matches = []
+    if vuln_file:
+        try:
+            if vuln_file.name.endswith('.json'):
+                vuln_data = json.load(vuln_file)
+                st.info("Loaded JSON vuln DB.")
+                # naive matching
+                for s in edited['service'].unique():
+                    for entry in (vuln_data if isinstance(vuln_data, list) else vuln_data.get('results',[])):
+                        product = str(entry.get('product','')).lower()
+                        if product and product in str(s).lower():
+                            cve_matches.append({"service": s, "cve": entry.get('cve',''), "summary": entry.get('summary','')})
+            else:
+                vuln_df = pd.read_csv(vuln_file)
+                for s in edited['service'].unique():
+                    matches = vuln_df[vuln_df.apply(lambda r: str(s).lower() in str(r.astype(str).values).lower(), axis=1)]
+                    for _, r in matches.iterrows():
+                        cve_matches.append({"service": s, "cve": r.get('cve',''), "summary": r.to_dict()})
+            if cve_matches:
+                st.success(f"{len(cve_matches)} local matches found.")
+                st.table(pd.DataFrame(cve_matches))
+            else:
+                st.info("No local matches found.")
+        except Exception as e:
+            st.error(f"Error parsing vuln file: {e}")
+
+    # Export CSV/JSON
+    out_csv = edited.to_csv(index=False)
+    st.download_button("Download CSV", out_csv, file_name=f"{project}_selmap.csv", mime="text/csv")
+    st.download_button("Download JSON", edited.to_json(orient='records', indent=2), file_name=f"{project}_selmap.json", mime="application/json")
+
+    # Generate GNMAP-like text
+    if st.button("Generate simple gnmap-like text"):
+        out_lines = []
+        grouped = edited.groupby('host')
+        for host, group in grouped:
+            ports_txt = []
+            for _, row in group.iterrows():
+                svc = str(row.get('service',''))
+                proto = str(row.get('proto',''))
+                port = str(row.get('port',''))
+                ports_txt.append(f"{port}/open/{proto}//{svc}///")
+            out_lines.append(f"Host: {host} ()\tPorts: {','.join(ports_txt)}\tStatus: Up")
+        out_text = "\n".join(out_lines)
+        st.code(out_text)
+        st.download_button("Download modified_gnmap.txt", data=out_text, file_name=f"{project}_modified_gnmap.txt", mime="text/plain")
+
+    # PDF report (simple) using reportlab
+    if st.button("Generate PDF report"):
+        # build a simple PDF
+        buffer = BytesIO()
+        c = canvas.Canvas(buffer, pagesize=A4)
+        width, height = A4
+        margin = 40
+        y = height - margin
+        c.setFont("Helvetica-Bold", 14)
+        c.drawString(margin, y, f"SelMap Report — {project}")
+        y -= 20
+        c.setFont("Helvetica", 10)
+        c.drawString(margin, y, f"Generated: {datetime.utcnow().isoformat()} UTC")
+        y -= 20
+        grouped = edited.groupby('host')
+        for host, group in grouped:
+            if y < 120:
+                c.showPage()
+                y = height - margin
+            c.setFont("Helvetica-Bold", 11)
+            c.drawString(margin, y, f"Host: {host}")
+            y -= 14
+            c.setFont("Helvetica", 9)
+            for _, r in group.iterrows():
+                line = f"Port: {r.get('port')} / {r.get('proto')} / {r.get('service')} (Risk: {r.get('risk_level')})"
+                c.drawString(margin + 10, y, line)
+                y -= 12
+                if y < 80:
+                    c.showPage()
+                    y = height - margin
+            y -= 6
+        c.save()
+        buffer.seek(0)
+        b64 = base64.b64encode(buffer.read()).decode()
+        href = f'<a href="data:application/pdf;base64,{b64}" download="{project}_selmap_report.pdf">Download PDF report</a>'
+        st.markdown(href, unsafe_allow_html=True)
+
+    # simple text report
+    if st.button("Generate text report"):
+        summary = []
+        summary.append(f"SelMap Report — Project: {project}")
+        summary.append(f"Generated: {datetime.utcnow().isoformat()} UTC")
+        summary.append("")
+        grouped = edited.groupby('host')
+        for host, g in grouped:
+            summary.append(f"Host: {host}")
+            for _, r in g.iterrows():
+                summary.append(f"  - Port: {r['port']} / {r['proto']} / {r['service']} (risk: {r.get('risk_level','')})")
+            summary.append("")
+        report_text = "\n".join(summary)
+        st.code(report_text)
+        st.download_button("Download report.txt", report_text, file_name=f"{project}_report.txt", mime="text/plain")
+
+else:
+    st.info("Henüz veri yok. Nmap çıktı dosyanızı yükleyin veya yan taraftan örnek veriyi yükleyin.")
+    st.markdown("### Güvenlik hatırlatması")
+    st.markdown("""
+    - SelMap **tarama yapmaz**. Tarama sonuçlarını yalnızca kullanıcı yükler.  
+    - Başkalarının sistemlerine zarar vermeyin veya izinsiz test yapmayın.  
+    - Her zaman yazılı izin alın ve izole lab'larda çalışın.
+    """)

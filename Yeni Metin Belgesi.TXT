@@ -1,0 +1,6 @@
+streamlit
+pandas
+defusedxml
+python-dateutil
+reportlab
+tabulate
